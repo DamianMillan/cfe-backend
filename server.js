@@ -10,7 +10,6 @@ const PORT = process.env.PORT || 8080;
 /* ---------------- Middlewares ---------------- */
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
-
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.options("*", cors());
 app.use(express.json({ limit: "256kb" }));
@@ -24,121 +23,138 @@ app.get("/api/ping", (_req, res) => res.json({ ok: true, at: new Date().toISOStr
 function urlForTariff(code) {
   const base = "https://app.cfe.mx/Aplicaciones/CCFE/Tarifas/TarifasCRECasa/Tarifas/";
   const map = {
-    "1":  "Tarifa1.aspx",
-    "1A": "Tarifa1A.aspx",
-    "1B": "Tarifa1B.aspx",
-    "1C": "Tarifa1C.aspx",
-    "1D": "Tarifa1D.aspx",
-    "1E": "Tarifa1E.aspx",
-    "1F": "Tarifa1F.aspx",
-    "DAC":"TarifaDAC.aspx",
+    "1": "Tarifa1.aspx", "1A":"Tarifa1A.aspx","1B":"Tarifa1B.aspx","1C":"Tarifa1C.aspx",
+    "1D":"Tarifa1D.aspx","1E":"Tarifa1E.aspx","1F":"Tarifa1F.aspx","DAC":"TarifaDAC.aspx"
   };
   return base + (map[code] || map["1"]);
 }
-
 const MESES = ["","ENERO","FEBRERO","MARZO","ABRIL","MAYO","JUNIO","JULIO","AGOSTO","SEPTIEMBRE","OCTUBRE","NOVIEMBRE","DICIEMBRE"];
+const toNum = (s) => { if (s == null) return NaN; const m = String(s).replace(/\s/g,"").replace(",",".").match(/-?\d+(?:\.\d+)?/); return m ? Number(m[0]) : NaN; };
+const pickPrice = (nums, {min=0.2, max=10} = {}) => nums.find(v => Number.isFinite(v) && v >= min && v <= max) ?? null;
+function isMonthInSummer(month, start){ for(let i=0;i<6;i++){ const m=((start-1+i)%12)+1; if(m===month) return true;} return false; }
 
-const toNum = (s) => {
-  if (s == null) return NaN;
-  const m = String(s).replace(/\s/g,"").replace(",",".").match(/-?\d+(?:\.\d+)?/);
-  return m ? Number(m[0]) : NaN;
-};
-const pickPrice = (nums, {min=0.2, max=10} = {}) =>
-  nums.find(v => Number.isFinite(v) && v >= min && v <= max) ?? null;
-
-// ¿El mes (1..12) está en verano (6 meses) si el verano inicia en `start` (1..12)?
-function isMonthInSummer(month, start) {
-  for (let i = 0; i < 6; i++) {
-    const m = ((start - 1 + i) % 12) + 1;
-    if (m === month) return true;
-  }
-  return false;
-}
-
-/* ---------------- Playwright (pool simple) ---------------- */
+/* ---------------- Playwright (pool) ---------------- */
 let sharedBrowser;
 async function getBrowser() {
   if (!process.env.PLAYWRIGHT_BROWSERS_PATH) process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
   if (sharedBrowser && (await sharedBrowser.version())) return sharedBrowser;
-  sharedBrowser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"],
-  });
+  sharedBrowser = await chromium.launch({ headless: true, args: ["--no-sandbox","--disable-dev-shm-usage"] });
   return sharedBrowser;
 }
 process.on("SIGINT", async () => { try { await sharedBrowser?.close(); } finally { process.exit(0); } });
 process.on("SIGTERM", async () => { try { await sharedBrowser?.close(); } finally { process.exit(0); } });
 
+/* -------- Buscar un “scope” con tablas (main o iframe) -------- */
+async function findScopeWithTables(page) {
+  // 1) ¿Hay tablas en la página principal?
+  if (await page.locator("table").count().catch(()=>0)) return page;
+  // 2) Busca en frames
+  for (const f of page.frames()) {
+    try {
+      if (await f.locator("table").count()) return f;
+    } catch {}
+  }
+  return null;
+}
+
+/* -------- Select con posible postback (ASP.NET) -------- */
+async function selectWithPostback(page, selectors, { value, label } = {}) {
+  for (const sel of selectors) {
+    const dd = await page.$(sel);
+    if (!dd) continue;
+    try {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle", timeout: 25000 }),
+        dd.selectOption(value != null ? { value: String(value) } : { label: String(label) }),
+      ]);
+      return true;
+    } catch {
+      try { await dd.selectOption(value != null ? { value: String(value) } : { label: String(label) }); } catch {}
+      await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{});
+      return true;
+    }
+  }
+  return false;
+}
+
 /* ---------------- Endpoint principal ---------------- */
 app.get("/api/cfe-tarifa", async (req, res) => {
   const code = String(req.query.tarifa || "1D").toUpperCase();
   const year = Number(req.query.anio || new Date().getFullYear());
-  const monthNum = Number(req.query.mes || (new Date().getMonth() + 1)); // 1..12
-  const summerStart = Number(req.query.inicioVerano || 5);               // MAYO=5
+  const monthNum = Number(req.query.mes || (new Date().getMonth() + 1));
+  const summerStart = Number(req.query.inicioVerano || 5);
   const isBimonthly = req.query.bimestral !== "false";
   const wantDebug = String(req.query.debug || "0") === "1";
 
   let context, page;
   try {
     const browser = await getBrowser();
-    context = await browser.newContext({ locale: "es-MX" });
+    context = await browser.newContext({ locale: "es-MX",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36" });
     page = await context.newPage({ bypassCSP: true });
-    page.setDefaultTimeout(45000); // ↑ margen
+    page.setDefaultTimeout(50000);
 
-    // 1) Cargar página de la tarifa
-    await page.goto(urlForTariff(code), { waitUntil: "domcontentloaded", timeout: 45000 });
+    // 1) Cargar página
+    await page.goto(urlForTariff(code), { waitUntil: "domcontentloaded", timeout: 50000 });
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{});
+    await page.locator('button:has-text("Aceptar"), button:has-text("ACEPTAR"), text=/Entendido/i').first().click({ timeout: 1500 }).catch(()=>{});
 
-    // Aceptar cookies/banners si aparecen (no falla si no existen)
-    await page.locator('button:has-text("Aceptar"), button:has-text("ACEPTAR"), text=/Entendido/i').first()
-      .click({ timeout: 2000 }).catch(()=>{});
-
-    // 2) Esperar a que haya controles o tablas (tolerante)
+    // 2) Espera a que haya selects/tablas (no falla si tarda)
     await Promise.race([
       page.waitForSelector("select", { timeout: 20000 }).catch(()=>{}),
-      page.waitForSelector("table", { timeout: 20000 }).catch(()=>{}),
+      page.waitForSelector("table",  { timeout: 20000 }).catch(()=>{}),
       page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{}),
     ]);
 
-    // 3) Mes de inicio de verano (si existe)
+    // 3) Selects
     await selectWithPostback(page, [
-      'select[id*="ddlMesInicioVerano"]',
-      'select[name*="ddlMesInicioVerano"]',
-      'xpath=//label[contains(., "comienza el verano")]/following::select[1]',
-      'xpath=//*[contains(.,"comienza el verano")]/following::select[1]',
+      'select[id*="ddlMesInicioVerano"]','select[name*="ddlMesInicioVerano"]',
+      'xpath=//label[contains(., "comienza el verano")]/following::select[1]','xpath=//*[contains(.,"comienza el verano")]/following::select[1]',
     ], { value: summerStart }).catch(()=>{});
 
-    // 4) Mes que deseas consultar
     const etiquetaMes = MESES[monthNum] || String(monthNum);
     await selectWithPostback(page, [
-      'select[id*="ddlMesConsulta"]',
-      'select[name*="ddlMesConsulta"]',
+      'select[id*="ddlMesConsulta"]','select[name*="ddlMesConsulta"]',
       'xpath=//label[contains(., "mes que deseas consultar")]/following::select[1]',
-      'xpath=//*[contains(.,"mes que deseas consultar")]/following::select[1]',
-      'xpath=(//select)[last()]',
-    ], { value: monthNum, label: etiquetaMes });
+      'xpath=//*[contains(.,"mes que deseas consultar")]/following::select[1]','xpath=(//select)[last()]',
+    ], { value: monthNum, label: etiquetaMes }).catch(()=>{});
 
-    // Esperar un poco a que ASP.NET haga postback, pero sin fallar si se tarda
     await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(()=>{});
     await page.waitForTimeout(800);
 
-    /* 5) Elegir la tabla correcta según temporada y EXTRAER filas */
+    // 4) Localiza tablas (en main o en iframe)
+    const scope = await findScopeWithTables(page);
+    if (!scope) {
+      if (wantDebug) {
+        const frames = await Promise.all(page.frames().map(async f => ({
+          url: f.url(),
+          tables: await f.locator("table").count().catch(()=>0),
+          selects: await f.locator("select").count().catch(()=>0),
+          title: await f.title().catch(()=>null)
+        })));
+        const htmlSnippet = (await page.content()).slice(0, 2000);
+        return res.json({ debug: { frames, htmlSnippetLen: htmlSnippet.length, htmlSnippet }});
+      }
+      return res.status(404).json({ error: "No encontré tablas en la página de CFE." });
+    }
+
+    /* 5) Extrae filas */
     let rows = [];
     if (code === "DAC") {
-      rows = await page.$$eval("table tr", trs =>
-        trs.map(tr => Array.from(tr.querySelectorAll("th,td")).map(td => td.innerText.trim()))
-      );
+      rows = await scope.$$eval("table tr", trs => trs.map(tr => Array.from(tr.querySelectorAll("th,td")).map(td => td.innerText.trim())));
     } else {
       const summer = isMonthInSummer(monthNum, summerStart);
       const heading = summer ? "Temporada de verano" : "Fuera de verano";
-      // intenta por heading, si no, toma la primera tabla significativa
-      const table = await page.$(`xpath=(//*[contains(normalize-space(.), "${heading}")]/following::table)[1]`)
-                ?? await page.$('table');
+      const table = await (scope.$(`xpath=(//*[contains(normalize-space(.), "${heading}")]/following::table)[1]`)
+                     ?? scope.$("table"));
       if (!table) {
-        return res.status(404).json({ error: `No encontré tablas en la página de CFE.` });
+        if (wantDebug) {
+          const tablesCount = await scope.locator("table").count().catch(()=>0);
+          return res.json({ debug: { foundScope: true, tablesCount }});
+        }
+        return res.status(404).json({ error: `No encontré tablas visibles (scope).` });
       }
-      rows = await table.$$eval("tr", trs =>
-        trs.map(tr => Array.from(tr.querySelectorAll("th,td")).map(td => td.innerText.trim()))
-      );
+      rows = await table.$$eval("tr", trs => trs.map(tr => Array.from(tr.querySelectorAll("th,td")).map(td => td.innerText.trim())));
     }
     if (wantDebug) return res.json({ debugRows: rows });
 
@@ -160,17 +176,8 @@ app.get("/api/cfe-tarifa", async (req, res) => {
           if (Number.isFinite(fc)) fixedCharge = fc;
         }
       }
-      if (singlePrice == null) {
-        return res.status(404).json({ error: "No encontré $/kWh de DAC (usa ?debug=1 para inspección)." });
-      }
-      return res.json({
-        code, year, month: monthNum, isBimonthly,
-        fixedCharge: fixedCharge ?? 0,
-        minKWhPerMonth,
-        tiers: [],
-        singlePriceKWh: singlePrice,
-        fetchedAt: new Date().toISOString(),
-      });
+      if (singlePrice == null) return res.status(404).json({ error: "No encontré $/kWh de DAC (usa ?debug=1)." });
+      return res.json({ code, year, month: monthNum, isBimonthly, fixedCharge: fixedCharge ?? 0, minKWhPerMonth, tiers: [], singlePriceKWh: singlePrice, fetchedAt: new Date().toISOString() });
     }
 
     for (const r of rows) {
@@ -199,18 +206,11 @@ app.get("/api/cfe-tarifa", async (req, res) => {
     }
 
     const validTiers = tiers.filter(t => Number.isFinite(t.pricePerKWh));
-    if (!validTiers.length) {
-      return res.status(404).json({ error: "No pude leer los bloques (usa ?debug=1 para ver filas)." });
-    }
+    if (!validTiers.length) return res.status(404).json({ error: "No pude leer los bloques (usa ?debug=1)." });
 
     res.set("Cache-Control", "public, max-age=3600");
-    return res.json({
-      code, year, month: monthNum, isBimonthly,
-      fixedCharge: fixedCharge ?? 0,
-      minKWhPerMonth,
-      tiers: validTiers,
-      fetchedAt: new Date().toISOString(),
-    });
+    return res.json({ code, year, month: monthNum, isBimonthly, fixedCharge: fixedCharge ?? 0, minKWhPerMonth, tiers: validTiers, fetchedAt: new Date().toISOString() });
+
   } catch (e) {
     console.error("cfe-tarifa error:", e);
     return res.status(500).json({ error: String(e) });
@@ -220,26 +220,5 @@ app.get("/api/cfe-tarifa", async (req, res) => {
   }
 });
 
-/* -------- Helper: select con posible postback (ASP.NET) -------- */
-async function selectWithPostback(page, selectors, { value, label } = {}) {
-  for (const sel of selectors) {
-    const dd = await page.$(sel);
-    if (!dd) continue;
-    try {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: "networkidle", timeout: 20000 }),
-        dd.selectOption(value != null ? { value: String(value) } : { label: String(label) }),
-      ]);
-      return true;
-    } catch {
-      try { await dd.selectOption(value != null ? { value: String(value) } : { label: String(label) }); } catch {}
-      await page.waitForLoadState("networkidle", { timeout: 15000 });
-      return true;
-    }
-  }
-  return false;
-}
-
 /* ---------------- Arranque ---------------- */
 app.listen(PORT, "0.0.0.0", () => console.log(`API listening on :${PORT}`));
-
