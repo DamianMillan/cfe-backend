@@ -44,11 +44,9 @@ const toNum = (s) => {
   return m ? Number(m[0]) : NaN;
 };
 
-// rango defensivo; si algún día cambian los precios, ajusta max
 const pickPrice = (nums, {min=0.2, max=10} = {}) =>
   nums.find(v => Number.isFinite(v) && v >= min && v <= max) ?? null;
 
-// ¿El mes (1..12) está en verano (6 meses) si el verano inicia en `start` (1..12)?
 function isMonthInSummer(month, start) {
   for (let i = 0; i < 6; i++) {
     const m = ((start - 1 + i) % 12) + 1;
@@ -60,6 +58,10 @@ function isMonthInSummer(month, start) {
 /* ---------------- Playwright (pool simple) ---------------- */
 let sharedBrowser;
 async function getBrowser() {
+  if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+    // por si se te olvida ponerla en Render
+    process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
+  }
   if (sharedBrowser && (await sharedBrowser.version())) return sharedBrowser;
   sharedBrowser = await chromium.launch({
     headless: true,
@@ -74,8 +76,8 @@ process.on("SIGTERM", async () => { try { await sharedBrowser?.close(); } finall
 app.get("/api/cfe-tarifa", async (req, res) => {
   const code = String(req.query.tarifa || "1D").toUpperCase();
   const year = Number(req.query.anio || new Date().getFullYear());
-  const monthNum = Number(req.query.mes || (new Date().getMonth() + 1)); // 1..12
-  const summerStart = Number(req.query.inicioVerano || 5);               // MAYO=5
+  const monthNum = Number(req.query.mes || (new Date().getMonth() + 1));
+  const summerStart = Number(req.query.inicioVerano || 5);
   const isBimonthly = req.query.bimestral !== "false";
   const wantDebug = String(req.query.debug || "0") === "1";
 
@@ -86,11 +88,9 @@ app.get("/api/cfe-tarifa", async (req, res) => {
     page = await context.newPage({ bypassCSP: true });
     page.setDefaultTimeout(25000);
 
-    // 1) Cargar página de la tarifa
     await page.goto(urlForTariff(code), { waitUntil: "domcontentloaded", timeout: 25000 });
     await page.waitForLoadState("networkidle", { timeout: 15000 });
 
-    // 2) Mes de inicio de verano (si existe)
     await selectWithPostback(page, [
       'select[id*="ddlMesInicioVerano"]',
       'select[name*="ddlMesInicioVerano"]',
@@ -98,7 +98,6 @@ app.get("/api/cfe-tarifa", async (req, res) => {
       'xpath=//*[contains(.,"comienza el verano")]/following::select[1]',
     ], { value: summerStart }).catch(()=>{});
 
-    // 3) Mes que deseas consultar
     const etiquetaMes = MESES[monthNum] || String(monthNum);
     await selectWithPostback(page, [
       'select[id*="ddlMesConsulta"]',
@@ -108,7 +107,6 @@ app.get("/api/cfe-tarifa", async (req, res) => {
       'xpath=(//select)[last()]',
     ], { value: monthNum, label: etiquetaMes });
 
-    // 4) Esperar render
     if (code === "DAC") {
       await page.waitForSelector('text=/kWh|energ[ií]a/i', { timeout: 15000 });
     } else {
@@ -116,10 +114,8 @@ app.get("/api/cfe-tarifa", async (req, res) => {
     }
     await page.waitForLoadState("networkidle", { timeout: 8000 });
 
-    /* 5) Elegir la tabla correcta según temporada y EXTRAER filas de esa tabla */
     let rows = [];
     if (code === "DAC") {
-      // DAC: sin separación estricta por temporada
       rows = await page.$$eval("table tr", trs =>
         trs.map(tr => Array.from(tr.querySelectorAll("th,td")).map(td => td.innerText.trim()))
       );
@@ -136,7 +132,6 @@ app.get("/api/cfe-tarifa", async (req, res) => {
     }
     if (wantDebug) return res.json({ debugRows: rows });
 
-    /* 6) Parseo homogéneo */
     let fixedCharge = null;
     const minKWhPerMonth = 25;
     const tiers = [];
@@ -167,7 +162,6 @@ app.get("/api/cfe-tarifa", async (req, res) => {
       });
     }
 
-    // Tarifas 1..1F (tabla ya filtrada por temporada)
     for (const r of rows) {
       const joined = r.join(" ").toLowerCase();
       if (joined.includes("consumo básico") || joined.includes("consumo basico")) {
@@ -237,3 +231,4 @@ async function selectWithPostback(page, selectors, { value, label } = {}) {
 
 /* ---------------- Arranque ---------------- */
 app.listen(PORT, "0.0.0.0", () => console.log(`API listening on :${PORT}`));
+
