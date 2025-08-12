@@ -43,10 +43,10 @@ const toNum = (s) => {
   const m = String(s).replace(/\s/g,"").replace(",",".").match(/-?\d+(?:\.\d+)?/);
   return m ? Number(m[0]) : NaN;
 };
-
 const pickPrice = (nums, {min=0.2, max=10} = {}) =>
   nums.find(v => Number.isFinite(v) && v >= min && v <= max) ?? null;
 
+// ¿El mes (1..12) está en verano (6 meses) si el verano inicia en `start` (1..12)?
 function isMonthInSummer(month, start) {
   for (let i = 0; i < 6; i++) {
     const m = ((start - 1 + i) % 12) + 1;
@@ -58,10 +58,7 @@ function isMonthInSummer(month, start) {
 /* ---------------- Playwright (pool simple) ---------------- */
 let sharedBrowser;
 async function getBrowser() {
-  if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
-    // por si se te olvida ponerla en Render
-    process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
-  }
+  if (!process.env.PLAYWRIGHT_BROWSERS_PATH) process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
   if (sharedBrowser && (await sharedBrowser.version())) return sharedBrowser;
   sharedBrowser = await chromium.launch({
     headless: true,
@@ -76,8 +73,8 @@ process.on("SIGTERM", async () => { try { await sharedBrowser?.close(); } finall
 app.get("/api/cfe-tarifa", async (req, res) => {
   const code = String(req.query.tarifa || "1D").toUpperCase();
   const year = Number(req.query.anio || new Date().getFullYear());
-  const monthNum = Number(req.query.mes || (new Date().getMonth() + 1));
-  const summerStart = Number(req.query.inicioVerano || 5);
+  const monthNum = Number(req.query.mes || (new Date().getMonth() + 1)); // 1..12
+  const summerStart = Number(req.query.inicioVerano || 5);               // MAYO=5
   const isBimonthly = req.query.bimestral !== "false";
   const wantDebug = String(req.query.debug || "0") === "1";
 
@@ -86,11 +83,23 @@ app.get("/api/cfe-tarifa", async (req, res) => {
     const browser = await getBrowser();
     context = await browser.newContext({ locale: "es-MX" });
     page = await context.newPage({ bypassCSP: true });
-    page.setDefaultTimeout(25000);
+    page.setDefaultTimeout(45000); // ↑ margen
 
-    await page.goto(urlForTariff(code), { waitUntil: "domcontentloaded", timeout: 25000 });
-    await page.waitForLoadState("networkidle", { timeout: 15000 });
+    // 1) Cargar página de la tarifa
+    await page.goto(urlForTariff(code), { waitUntil: "domcontentloaded", timeout: 45000 });
 
+    // Aceptar cookies/banners si aparecen (no falla si no existen)
+    await page.locator('button:has-text("Aceptar"), button:has-text("ACEPTAR"), text=/Entendido/i').first()
+      .click({ timeout: 2000 }).catch(()=>{});
+
+    // 2) Esperar a que haya controles o tablas (tolerante)
+    await Promise.race([
+      page.waitForSelector("select", { timeout: 20000 }).catch(()=>{}),
+      page.waitForSelector("table", { timeout: 20000 }).catch(()=>{}),
+      page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{}),
+    ]);
+
+    // 3) Mes de inicio de verano (si existe)
     await selectWithPostback(page, [
       'select[id*="ddlMesInicioVerano"]',
       'select[name*="ddlMesInicioVerano"]',
@@ -98,6 +107,7 @@ app.get("/api/cfe-tarifa", async (req, res) => {
       'xpath=//*[contains(.,"comienza el verano")]/following::select[1]',
     ], { value: summerStart }).catch(()=>{});
 
+    // 4) Mes que deseas consultar
     const etiquetaMes = MESES[monthNum] || String(monthNum);
     await selectWithPostback(page, [
       'select[id*="ddlMesConsulta"]',
@@ -107,13 +117,11 @@ app.get("/api/cfe-tarifa", async (req, res) => {
       'xpath=(//select)[last()]',
     ], { value: monthNum, label: etiquetaMes });
 
-    if (code === "DAC") {
-      await page.waitForSelector('text=/kWh|energ[ií]a/i', { timeout: 15000 });
-    } else {
-      await page.waitForSelector('text=/Consumo\\s+b(á|a)sico|Intermedio|Excedente/i', { timeout: 15000 });
-    }
-    await page.waitForLoadState("networkidle", { timeout: 8000 });
+    // Esperar un poco a que ASP.NET haga postback, pero sin fallar si se tarda
+    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(()=>{});
+    await page.waitForTimeout(800);
 
+    /* 5) Elegir la tabla correcta según temporada y EXTRAER filas */
     let rows = [];
     if (code === "DAC") {
       rows = await page.$$eval("table tr", trs =>
@@ -122,9 +130,11 @@ app.get("/api/cfe-tarifa", async (req, res) => {
     } else {
       const summer = isMonthInSummer(monthNum, summerStart);
       const heading = summer ? "Temporada de verano" : "Fuera de verano";
-      const table = await page.$(`xpath=(//*[contains(normalize-space(.), "${heading}")]/following::table)[1]`);
+      // intenta por heading, si no, toma la primera tabla significativa
+      const table = await page.$(`xpath=(//*[contains(normalize-space(.), "${heading}")]/following::table)[1]`)
+                ?? await page.$('table');
       if (!table) {
-        return res.status(404).json({ error: `No encontré la sección "${heading}" en la página de CFE.` });
+        return res.status(404).json({ error: `No encontré tablas en la página de CFE.` });
       }
       rows = await table.$$eval("tr", trs =>
         trs.map(tr => Array.from(tr.querySelectorAll("th,td")).map(td => td.innerText.trim()))
@@ -132,6 +142,7 @@ app.get("/api/cfe-tarifa", async (req, res) => {
     }
     if (wantDebug) return res.json({ debugRows: rows });
 
+    /* 6) Parseo */
     let fixedCharge = null;
     const minKWhPerMonth = 25;
     const tiers = [];
